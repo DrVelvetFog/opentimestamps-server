@@ -11,6 +11,7 @@
 
 import collections
 import logging
+import math
 import threading
 import time
 import random
@@ -248,9 +249,17 @@ class Stamper:
         bumped appropriately.
         """
 
-        delta_fee = int((old_tx.calc_weight() + 3)/4 * relay_feerate)
-
         old_change_txout = old_tx.vout[0]
+
+        # A non-finite feerate (e.g. a fee-bump that overflowed to inf; see
+        # #114/#116) would crash int() with OverflowError and silently brick
+        # the stamper. Guard it: an infinite feerate means "more fee than the
+        # change can possibly pay", so fall through to the minimal, no-change
+        # transaction below instead of raising.
+        if math.isfinite(relay_feerate):
+            delta_fee = int((old_tx.calc_weight() + 3)/4 * relay_feerate)
+        else:
+            delta_fee = old_change_txout.nValue
 
         if old_change_txout.nValue - delta_fee > DUST:
             return CTransaction(old_tx.vin,
@@ -484,6 +493,21 @@ class Stamper:
                     # Insufficient priority - basically means we didn't
                     # pay enough, so try again with a higher feerate
                     bump_feerate *= 1.25
+
+                    # Bound the fee bumping. If the node keeps rejecting txs
+                    # with -26 (which can happen persistently, e.g. on testnet
+                    # when local relay policy disagrees with our feerate), an
+                    # unbounded bump_feerate climbs every iteration until it
+                    # overflows to inf and crashes __update_timestamp_tx(),
+                    # silently bricking the calendar (#114/#116). Once a bumped
+                    # fee would exceed max_fee there is nothing to gain from
+                    # retrying this cycle, so give up cleanly and let the next
+                    # tick start fresh -- the same outcome as the fee > max_fee
+                    # check above, just reached before the tx is signed again.
+                    vsize = (unsigned_tx.calc_weight() + 3) // 4
+                    if bump_feerate * vsize > self.max_fee:
+                        logging.error("Maximum txfee reached while fee bumping!")
+                        return
                     continue
 
                 else:
